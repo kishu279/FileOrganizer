@@ -1,18 +1,26 @@
 // Import standard library modules
+extern crate google_drive3 as drive3;
+use drive3::{DriveHub, api::File as DriveFile, hyper_rustls, hyper_util, yup_oauth2};
+use std::collections::HashMap;
+// use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+// use std::path::PathBuf;
 use std::sync::mpsc;
 use std::{collections::HashSet, fs, io, path::Path};
+use walkdir::WalkDir;
+use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
 // External crates
 use chrono::{DateTime, Local}; // For handling file modified date/time
 use clap::{Arg, Command};
 use notify::{
-    event::ModifyKind, Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind,
 };
 use sha2::{Digest, Sha256};
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CLI argument parsing using clap
     let matches = Command::new("FileOrganizer")
         .version("1.0")
@@ -31,19 +39,118 @@ fn main() -> io::Result<()> {
                 .num_args(0)
                 .help("Enable watch mode to auto-organize new files."),
         )
+        .arg(
+            Arg::new("upload")
+                .short('u')
+                .long("upload")
+                .num_args(0)
+                .help("Upload folders data on google drive"),
+        )
         .get_matches();
 
     // Extract values from the parsed CLI arguments
     let folder_path = matches.get_one::<String>("path").unwrap();
     let watch_mode = matches.get_flag("watch");
-
-    //  Step 1: Organize all existing files once
-    organize_files(folder_path)?;
+    let upload = matches.get_flag("upload");
 
     //  Step 2: If watch mode is enabled, keep watching for new files
     if watch_mode {
         println!("Watching for new files in {}", folder_path);
         watch_folder(folder_path)?;
+    } else if upload {
+        // upload all the files to google drive
+        println!("Uploading files to google drive");
+        let result = upload_to_drive(&folder_path).await?;
+
+        println!("📁 Uploaded files to google drive");
+    } else {
+        //  Step 1: Organize all existing files once
+        organize_files(folder_path)?;
+    }
+
+    Ok(())
+}
+
+/// authenticates the user and just upload the files
+/// to google drive
+async fn upload_to_drive(path: &String) -> Result<(), Box<dyn std::error::Error>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let oauth_path = format!("{}/.sortit/oauth.json", home);
+    let token_path = format!("{}/.sortit/tokens.json", home);
+
+    // get the secrets
+    let secret = yup_oauth2::read_application_secret(&oauth_path).await?;
+
+    // ge the client
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .unwrap()
+                .https_or_http()
+                .enable_http1()
+                .build(),
+        );
+
+    let auth = InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
+        .persist_tokens_to_disk(&token_path)
+        .build()
+        .await?;
+
+    let hub = DriveHub::new(client, auth);
+
+    let path = Path::new(&path);
+    let mut folder_ids: HashMap<String, String> = HashMap::new();
+
+    if path.is_dir() {
+        // prepare meta data first
+        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+
+            if path.is_dir() {
+                let mut folder_metadata = DriveFile::default();
+                folder_metadata.name = Some(file_name);
+                folder_metadata.mime_type = Some("application/vnd.google-apps.folder".to_string());
+
+                // Set parent folder if not root -> not understood
+                if let Some(parent) = path.parent() {
+                    if let Some(parent_id) = folder_ids.get(&parent.to_string_lossy().to_string()) {
+                        folder_metadata.parents = Some(vec![parent_id.clone()]);
+                    }
+                }
+
+                let result = hub
+                    .files()
+                    .create(folder_metadata)
+                    .upload(std::io::empty(), "application/json".parse()?)
+                    .await?;
+
+                let folder_id = result.1.id.unwrap();
+                folder_ids.insert(path.to_string_lossy().to_string(), folder_id.clone());
+                println!("Created folder {} with id {}", path.display(), folder_id);
+            } else if path.is_file() {
+                let mut file_metadata = DriveFile::default();
+                file_metadata.name = Some(file_name.clone());
+
+                // parent folder
+                if let Some(parent_id) =
+                    folder_ids.get(&path.parent().unwrap().to_string_lossy().to_string())
+                {
+                    file_metadata.parents = Some(vec![parent_id.clone()]);
+                }
+
+                let file = std::fs::File::open(path)?;
+                let _result_upload = hub
+                    .files()
+                    .create(file_metadata)
+                    .upload(file, "application/octet-stream".parse()?)
+                    .await?;
+
+                println!("🧾 Uploaded file: {}", path.display());
+            }
+        }
+    } else if path.is_file() {
     }
 
     Ok(())

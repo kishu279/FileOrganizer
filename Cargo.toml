@@ -1,3 +1,4 @@
+
 [package]
 name = "sortit"
 version = "0.1.0"
@@ -21,3 +22,10 @@ chrono = "0.4.42"
 clap = { version = "4.5", features = ["derive"] }
 notify = "8.2.0"
 sha2 = "0.10.9"
+dotenv = "0.15.0"
+yup-oauth2 = "8"
+google-drive3 = "6"
+walkdir = "2.5.0"
+futures = "0.3.31"
+tokio-util = "0.7"
+tokio = { version = "1.48.0", features = ["full"] }
